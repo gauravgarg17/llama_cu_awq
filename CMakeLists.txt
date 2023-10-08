@@ -10,4 +10,4 @@ string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
 SET(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
 
 add_executable(weight_packer weight_packer.cpp)
-add_executable(llama2_q4 llama2_q4.cu)
+add_executable(llama2_q4 llama2_q4.cu llama2_q4_context.cu fp16_int4_gemm.cu)

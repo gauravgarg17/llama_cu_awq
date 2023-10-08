@@ -36,15 +36,15 @@ constexpr int group_size = 128; // hardcoded for this implementation
 // Transformer and RunState structs, and related memory management
 
 void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
-    cudaMalloc((void**)&s->x, p->dim * sizeof(half));
-    cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
-    cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(half));
-    cudaMalloc((void**)&s->hb2, p->hidden_dim * sizeof(half));
-    cudaMalloc((void**)&s->q, p->dim * sizeof(half));
-    cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
-    cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
-    cudaMalloc((void**)&s->key_cache, sizeof(half) * p->n_layers * p->seq_len * p->dim);    // potentially huge allocs
-    cudaMalloc((void**)&s->value_cache, sizeof(half) * p->n_layers * p->seq_len * p->dim);
+    cudaMalloc((void**)&s->x, p->dim * p->seq_len * sizeof(half));
+    cudaMalloc((void**)&s->xb, p->dim * p->seq_len * sizeof(half));
+    cudaMalloc((void**)&s->hb, p->hidden_dim * p->seq_len * sizeof(half));
+    cudaMalloc((void**)&s->hb2, p->hidden_dim * p->seq_len * sizeof(half));
+    cudaMalloc((void**)&s->q, p->dim * p->seq_len * sizeof(half));
+    cudaMalloc((void**)&s->att, p->n_heads * p->seq_len * p->seq_len * sizeof(half)); // too large allocation, can be removed if we use MHA
+    cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half)); // don't need logits for the complete sequence, just the last token
+    cudaMalloc((void**)&s->key_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));    // potentially huge allocs
+    cudaMalloc((void**)&s->value_cache, p->n_layers * p->seq_len * p->dim * sizeof(half));
 
     cudaMalloc((void**)&s->pos, sizeof(int));
     cudaMallocHost((void**)&s->shared_data, sizeof(SharedData));
@@ -82,14 +82,6 @@ void free_run_state(RunState* s) {
     cudaFree(s->key_cache);
     cudaFree(s->value_cache);
     cudaFreeHost(s->shared_data);
-}
-
-size_t getPackedWeightHeight(size_t height)
-{
-    // Each uint32 element in the packed weight matrix contain 8 elements from the original matrix.
-    // Also we load 4 uint's (32 elements) in a single instruction for getting better memory efficiency
-    // This requires us to align the "height" dimension to a multiple of 4 uint (or 32 elements)
-    return divUp(height, 32) * 4;
 }
 
 void allocQWeight(QWeight* pWeight, size_t height, size_t width) {
@@ -463,6 +455,10 @@ int main(int argc, char *argv[]) {
     Sampler sampler;
     build_sampler(&sampler, config.vocab_size, temperature, topp, rng_seed);
 
+    int dev = 0;
+    cudaDeviceProp deviceProp;
+    checkCudaErrors(cudaGetDeviceProperties(&deviceProp, dev));
+
     // create and init the application RunState
     RunState state;
     malloc_run_state(&state, &config, perplexity);
@@ -479,7 +475,8 @@ int main(int argc, char *argv[]) {
         parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &config, &state, &weights, &sampler);
     } 
     else
-    while (1) {
+    while (1) 
+    {
         encode(&tokenizer, input_message, 1, 0, prompt_tokens, &num_prompt_tokens);
         //printf("\nPrompt tokens: %d - \n", num_prompt_tokens);
         //for (int i = 0; i < num_prompt_tokens; i++) printf("%d ", prompt_tokens[i]);
@@ -498,14 +495,37 @@ int main(int argc, char *argv[]) {
         memcpy(&state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
 
         printf("<s>\n"); // explicit print the initial BOS token for stylistic symmetry reasons
+
+#define CTX_PHASE_OPT 0
+#if CTX_PHASE_OPT
+        // run context phase
+        transformer_ctx(&config, &state, &weights, num_prompt_tokens, deviceProp, stream);
+        pos = 1;
+
+        while(pos < num_prompt_tokens) {
+            next = state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+            char* piece = decode(&tokenizer, token, next);
+            safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+            if (next == eos_token) break; // break if EOS token is reached
+
+            // advance forward
+            token = next;
+            pos++;
+        }
+        fflush(stdout);
+
+        // wait for GPU work for previous iteration to complete
+        cudaStreamSynchronize(stream);
+#endif
+
+        long prompt_tokens = pos;
+        long ctxEnd = time_in_ms();  // used to time our code
+
         while (pos < steps) {
-            // wait for GPU work for previous iteration to complete
-            // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
-            cudaStreamSynchronize(stream);
             // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
             transformer(pos >= num_prompt_tokens - 1, &config, &state, &weights, false, &sampler); // forward the transformer to get next token
 
-            if (pos > 0)
+            if(pos > 0)
             {
                 next = state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
                 char* piece = decode(&tokenizer, token, next);
@@ -516,13 +536,19 @@ int main(int argc, char *argv[]) {
                 token = next;
             }
             pos++;
+
+            // wait for GPU work for previous iteration to complete
+            // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
+            cudaStreamSynchronize(stream);
         }
 
         // report achieved tok/s
         long end = time_in_ms();
-        double time = (end - start) / 1000.0;
-        int timed_tokens = pos - 1;
-        printf("\nachieved tok/s: %f. Tokens: %d, seconds: %g\n", timed_tokens / time, timed_tokens, time);
+        double ctxTime = (ctxEnd - start) / 1000.0;
+        double genTime = (end - ctxEnd) / 1000.0;
+        int gen_tokens = pos - prompt_tokens;
+        printf("\nPrompt processing- achieved tok/s: %f. Tokens: %d, seconds: %g\n", prompt_tokens / ctxTime, prompt_tokens, ctxTime);
+        printf("Gen Phase- achieved tok/s: %f. Tokens: %d, seconds: %g\n", gen_tokens / genTime, gen_tokens, genTime);
 
         printf("enter next prompt: ");
         fgets(input_message, sizeof(input_message), stdin);

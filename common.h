@@ -72,6 +72,49 @@ typedef struct {
     float rope_theta; // theta for the rope rotational embedding. TODO: This really should be part of Config!
 } RunState;
 
-int divUp(int a, int b) {
+inline int divUp(int a, int b) {
     return (a - 1) / b + 1;
 }
+
+void transformer_ctx(Config* p, RunState* s, TransformerWeights* w, int prompt_len, cudaDeviceProp& deviceProp, cudaStream_t stream);
+
+void fp16_int4_gemm(cudaDeviceProp& deviceProp, cudaStream_t stream, int prompt_len, half* xout, half* x, QWeight& w, int inpSize, int opSize, bool accum = false);
+
+inline size_t getPackedWeightHeight(size_t height)
+{
+    // Each uint32 element in the packed weight matrix contain 8 elements from the original matrix.
+    // Also we load 4 uint's (32 elements) in a single instruction for getting better memory efficiency
+    // This requires us to align the "height" dimension to a multiple of 4 uint (or 32 elements)
+    return divUp(height, 32) * 4;
+}
+
+#define checkKernelErrors(expr)                             \
+  do {                                                      \
+    expr;                                                   \
+                                                            \
+    cudaError_t __err = cudaGetLastError();                 \
+    if (__err != cudaSuccess) {                             \
+      printf("Line %d: '%s' failed: %s\n", __LINE__, #expr, \
+             cudaGetErrorString(__err));                    \
+      abort();                                              \
+    }                                                       \
+  } while (0)
+
+static const char* _cudaGetErrorEnum(cudaError_t error) {
+    return cudaGetErrorName(error);
+}
+
+template <typename T>
+void check(T result, char const* const func, const char* const file,
+    int const line) {
+    if (result) {
+        fprintf(stderr, "CUDA error at %s:%d code=%d(%s) \"%s\" \n", file, line,
+            static_cast<unsigned int>(result), _cudaGetErrorEnum(result), func);
+        exit(EXIT_FAILURE);
+    }
+}
+
+  #define checkCudaErrors(val) check((val), #val, __FILE__, __LINE__)
+
+
+#define DUMP_PER_TOKEN_TIMINGS 0
